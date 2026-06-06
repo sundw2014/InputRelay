@@ -39,6 +39,7 @@ TARGET_IP = "10.0.0.209"     # gaming PC running receiver.py
 TARGET_PORT = 9999
 KEEPALIVE_MS = 100           # resend held mouse-button state at least this often
 MOUSE_FLUSH_MS = 2           # how often the worker flushes accumulated mouse motion
+MOUSE_SENSITIVITY = 0.4      # scale relayed mouse deltas (lower = slower). Tune to taste.
 CONTROLLER_POLL_HZ = 500
 
 # Toggle hotkey = hold Ctrl+Alt+Shift together. Quit = Ctrl+Alt+Shift+Q
@@ -444,6 +445,7 @@ def mouse_worker(sender, mstate, stop):
     keepalive = KEEPALIVE_MS / 1000.0
     last_send = 0.0
     last_kb = 0.0
+    rem_x = rem_y = 0.0  # sub-pixel remainder carried across flushes
     pkt = 0
     last_report = time.time()
     last_dx = last_dy = 0
@@ -464,15 +466,22 @@ def mouse_worker(sender, mstate, stop):
         if now - last_kb >= keepalive:
             sender.keyboard(kb_snap)
             last_kb = now
-        if dx or dy or wheel or dirty:
-            # clamp deltas to int16 range just in case
-            dx = max(-32768, min(32767, dx))
-            dy = max(-32768, min(32767, dy))
+        # Scale deltas down (sensitivity), carrying the sub-pixel remainder so
+        # slow movements aren't rounded away to zero.
+        fx = dx * MOUSE_SENSITIVITY + rem_x
+        fy = dy * MOUSE_SENSITIVITY + rem_y
+        sdx = int(fx)
+        sdy = int(fy)
+        rem_x = fx - sdx
+        rem_y = fy - sdy
+        if sdx or sdy or wheel or dirty:
+            sdx = max(-32768, min(32767, sdx))
+            sdy = max(-32768, min(32767, sdy))
             wheel = max(-128, min(127, wheel))
-            sender.mouse(dx, dy, wheel, buttons)
+            sender.mouse(sdx, sdy, wheel, buttons)
             last_send = now
             pkt += 1
-            last_dx, last_dy = dx, dy
+            last_dx, last_dy = sdx, sdy
         elif now - last_send >= keepalive:
             sender.mouse(0, 0, 0, buttons)
             last_send = now

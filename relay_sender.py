@@ -199,6 +199,7 @@ class HookThread(threading.Thread):
         self._ms_proc = HOOKPROC(self._mouse_proc)
         self._kb_hook = None
         self._ms_hook = None
+        self._last_pt = None  # for delta tracking in non-suppressing test mode
         self.cx = user32.GetSystemMetrics(SM_CXSCREEN) // 2
         self.cy = user32.GetSystemMetrics(SM_CYSCREEN) // 2
 
@@ -209,12 +210,13 @@ class HookThread(threading.Thread):
             self.m.acc_dx = self.m.acc_dy = self.m.wheel = 0
             self.m.buttons = 0
             self.m.buttons_dirty = False
+        self._last_pt = None
         if on:
-            user32.SetCursorPos(self.cx, self.cy)
-            print("\n[MOUSE CAPTURE ON]  (Ctrl+Alt+End to release)")
+            print("\n[MOUSE RELAY ON]  TEST MODE: Surface cursor still moves; "
+                  "watch 'mouse pkt/s' below. (Ctrl+Alt+End to stop)")
         else:
             self.sender.control(P.CTRL_RELEASE_ALL_KBM)
-            print("\n[MOUSE CAPTURE OFF] mouse restored locally")
+            print("\n[MOUSE RELAY OFF]")
         async_beep(on)
 
     # keyboard: detect hotkey only; never suppress normal keys, never relay.
@@ -238,6 +240,8 @@ class HookThread(threading.Thread):
     # mouse: only accumulate state; the worker thread sends.
     # Wrapped so an exception falls through to a normal (non-captured) mouse event.
     def _mouse_proc(self, nCode, wParam, lParam):
+        # TEST MODE: observe and relay, but DO NOT suppress -- the Surface mouse
+        # keeps working normally. Deltas are computed from successive positions.
         try:
             if nCode == 0:
                 with self.m.lock:
@@ -245,31 +249,30 @@ class HookThread(threading.Thread):
                 if capturing:
                     ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                     if wParam == WM_MOUSEMOVE:
-                        if not (ms.flags & LLMHF_INJECTED):
-                            dx = ms.pt.x - self.cx
-                            dy = ms.pt.y - self.cy
+                        x, y = ms.pt.x, ms.pt.y
+                        if self._last_pt is not None:
+                            dx = x - self._last_pt[0]
+                            dy = y - self._last_pt[1]
                             if dx or dy:
                                 with self.m.lock:
                                     self.m.acc_dx += dx
                                     self.m.acc_dy += dy
-                                user32.SetCursorPos(self.cx, self.cy)
-                        return 1
-                    if wParam == WM_MOUSEWHEEL:
+                        self._last_pt = (x, y)
+                    elif wParam == WM_MOUSEWHEEL:
                         delta = ctypes.c_short((ms.mouseData >> 16) & 0xFFFF).value
                         with self.m.lock:
                             self.m.wheel += delta // WHEEL_DELTA
-                        return 1
-                    btn = self._button_for(wParam, ms.mouseData)
-                    if btn is not None:
-                        down = wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
-                                          WM_MBUTTONDOWN, WM_XBUTTONDOWN)
-                        with self.m.lock:
-                            if down:
-                                self.m.buttons |= btn
-                            else:
-                                self.m.buttons &= ~btn
-                            self.m.buttons_dirty = True
-                        return 1
+                    else:
+                        btn = self._button_for(wParam, ms.mouseData)
+                        if btn is not None:
+                            down = wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
+                                              WM_MBUTTONDOWN, WM_XBUTTONDOWN)
+                            with self.m.lock:
+                                if down:
+                                    self.m.buttons |= btn
+                                else:
+                                    self.m.buttons &= ~btn
+                                self.m.buttons_dirty = True
         except Exception as e:
             print("mouse hook error (ignored):", e)
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
@@ -312,6 +315,9 @@ def mouse_worker(sender, mstate, stop):
     interval = MOUSE_FLUSH_MS / 1000.0
     keepalive = KEEPALIVE_MS / 1000.0
     last_send = 0.0
+    pkt = 0
+    last_report = time.time()
+    last_dx = last_dy = 0
     while not stop.is_set():
         time.sleep(interval)
         with mstate.lock:
@@ -330,9 +336,16 @@ def mouse_worker(sender, mstate, stop):
             wheel = max(-128, min(127, wheel))
             sender.mouse(dx, dy, wheel, buttons)
             last_send = now
+            pkt += 1
+            last_dx, last_dy = dx, dy
         elif now - last_send >= keepalive:
             sender.mouse(0, 0, 0, buttons)
             last_send = now
+        if now - last_report >= 1.0:
+            print(f"\rmouse pkt/s={pkt:4d}  last dx,dy=({last_dx:+5d},{last_dy:+5d})  "
+                  f"buttons=0x{buttons:02x}   ", end="", flush=True)
+            pkt = 0
+            last_report = now
 
 
 # ============================================================

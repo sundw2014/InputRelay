@@ -82,7 +82,39 @@ LPARAM = ctypes.c_ssize_t
 ULONG_PTR = ctypes.c_size_t
 
 user32 = ctypes.windll.user32 if sys.platform == "win32" else None
+kernel32 = ctypes.windll.kernel32 if sys.platform == "win32" else None
 HOOKPROC = ctypes.CFUNCTYPE(LRESULT, ctypes.c_int, WPARAM, LPARAM)
+
+HHOOK = ctypes.c_void_p
+
+
+def _setup_winapi():
+    """Declare argtypes/restype so 64-bit pointers (lParam etc.) aren't truncated.
+    Without this, ctypes treats args as 32-bit int and overflows on every event."""
+    user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, wintypes.DWORD]
+    user32.SetWindowsHookExW.restype = HHOOK
+    user32.CallNextHookEx.argtypes = [HHOOK, ctypes.c_int, WPARAM, LPARAM]
+    user32.CallNextHookEx.restype = LRESULT
+    user32.UnhookWindowsHookEx.argtypes = [HHOOK]
+    user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    user32.GetMessageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT, wintypes.UINT]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.TranslateMessage.argtypes = [ctypes.c_void_p]
+    user32.DispatchMessageW.argtypes = [ctypes.c_void_p]
+    user32.DispatchMessageW.restype = LRESULT
+    user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, WPARAM, LPARAM]
+    user32.PostThreadMessageW.restype = wintypes.BOOL
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+    user32.SetCursorPos.restype = wintypes.BOOL
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = wintypes.SHORT
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+
+if user32 is not None:
+    _setup_winapi()
 
 
 class POINT(ctypes.Structure):
@@ -186,52 +218,60 @@ class HookThread(threading.Thread):
         async_beep(on)
 
     # keyboard: detect hotkey only; never suppress normal keys, never relay.
+    # Wrapped so an exception can NEVER brick the keyboard (always passes through).
     def _keyboard_proc(self, nCode, wParam, lParam):
-        if nCode == 0:
-            kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            if kb.vkCode == HOTKEY_VK and key_down(VK_CONTROL) and key_down(VK_MENU):
-                if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                    if key_down(VK_SHIFT):
-                        if self.thread_id is not None:
-                            user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
-                    else:
-                        self._toggle()
-                return 1  # swallow only the hotkey itself
+        try:
+            if nCode == 0:
+                kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                if kb.vkCode == HOTKEY_VK and key_down(VK_CONTROL) and key_down(VK_MENU):
+                    if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        if key_down(VK_SHIFT):
+                            if self.thread_id is not None:
+                                user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+                        else:
+                            self._toggle()
+                    return 1  # swallow only the hotkey itself
+        except Exception as e:
+            print("keyboard hook error (ignored):", e)
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     # mouse: only accumulate state; the worker thread sends.
+    # Wrapped so an exception falls through to a normal (non-captured) mouse event.
     def _mouse_proc(self, nCode, wParam, lParam):
-        if nCode == 0:
-            with self.m.lock:
-                capturing = self.m.capture
-            if capturing:
-                ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                if wParam == WM_MOUSEMOVE:
-                    if not (ms.flags & LLMHF_INJECTED):
-                        dx = ms.pt.x - self.cx
-                        dy = ms.pt.y - self.cy
-                        if dx or dy:
-                            with self.m.lock:
-                                self.m.acc_dx += dx
-                                self.m.acc_dy += dy
-                            user32.SetCursorPos(self.cx, self.cy)
-                    return 1
-                if wParam == WM_MOUSEWHEEL:
-                    delta = ctypes.c_short((ms.mouseData >> 16) & 0xFFFF).value
-                    with self.m.lock:
-                        self.m.wheel += delta // WHEEL_DELTA
-                    return 1
-                btn = self._button_for(wParam, ms.mouseData)
-                if btn is not None:
-                    down = wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
-                                      WM_MBUTTONDOWN, WM_XBUTTONDOWN)
-                    with self.m.lock:
-                        if down:
-                            self.m.buttons |= btn
-                        else:
-                            self.m.buttons &= ~btn
-                        self.m.buttons_dirty = True
-                    return 1
+        try:
+            if nCode == 0:
+                with self.m.lock:
+                    capturing = self.m.capture
+                if capturing:
+                    ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                    if wParam == WM_MOUSEMOVE:
+                        if not (ms.flags & LLMHF_INJECTED):
+                            dx = ms.pt.x - self.cx
+                            dy = ms.pt.y - self.cy
+                            if dx or dy:
+                                with self.m.lock:
+                                    self.m.acc_dx += dx
+                                    self.m.acc_dy += dy
+                                user32.SetCursorPos(self.cx, self.cy)
+                        return 1
+                    if wParam == WM_MOUSEWHEEL:
+                        delta = ctypes.c_short((ms.mouseData >> 16) & 0xFFFF).value
+                        with self.m.lock:
+                            self.m.wheel += delta // WHEEL_DELTA
+                        return 1
+                    btn = self._button_for(wParam, ms.mouseData)
+                    if btn is not None:
+                        down = wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
+                                          WM_MBUTTONDOWN, WM_XBUTTONDOWN)
+                        with self.m.lock:
+                            if down:
+                                self.m.buttons |= btn
+                            else:
+                                self.m.buttons &= ~btn
+                            self.m.buttons_dirty = True
+                        return 1
+        except Exception as e:
+            print("mouse hook error (ignored):", e)
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     @staticmethod

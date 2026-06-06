@@ -191,6 +191,19 @@ def key_down(vk):
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+def set_dpi_aware():
+    """Make coordinates consistent on high-DPI displays (e.g. a scaled Surface).
+    Without this, the hook's pt is in physical pixels while GetSystemMetrics and
+    SetCursorPos use logical pixels, which corrupts the recenter delta math."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_AWARE
+    except Exception:
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 def async_beep(on):
     if winsound:
         threading.Thread(target=winsound.Beep,
@@ -584,6 +597,8 @@ def controller_loop(sender, stop):
 def main():
     if sys.platform != "win32":
         sys.exit("relay_sender.py must run on Windows (uses Win32 hooks + XInput).")
+
+    set_dpi_aware()  # MUST be before reading screen metrics / installing hooks
 
     sender = Sender(TARGET_IP, TARGET_PORT)
     mstate = MouseState()

@@ -46,12 +46,14 @@ KEEPALIVE_MS = 100           # resend held mouse-button state at least this ofte
 MOUSE_FLUSH_MS = 2           # how often the worker flushes accumulated mouse motion
 CONTROLLER_POLL_HZ = 500
 
-HOTKEY_VK = 0x23             # VK_END  (Ctrl+Alt = toggle, +Shift = quit)
+# Toggle hotkey = hold Ctrl+Alt+Shift together. Quit = Ctrl+Alt+Shift+Q
+# (Ctrl+C in the terminal also quits, since the keyboard is not grabbed).
 # ------------------------------------------------------
 
 VK_CONTROL = 0x11
 VK_MENU = 0x12     # ALT
 VK_SHIFT = 0x10
+VK_Q = 0x51
 
 WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
@@ -200,6 +202,7 @@ class HookThread(threading.Thread):
         self._kb_hook = None
         self._ms_hook = None
         self._last_pt = None  # for delta tracking in non-suppressing test mode
+        self._combo_latched = False  # edge-trigger for the Ctrl+Alt+Shift hotkey
         self.cx = user32.GetSystemMetrics(SM_CXSCREEN) // 2
         self.cy = user32.GetSystemMetrics(SM_CYSCREEN) // 2
 
@@ -213,7 +216,7 @@ class HookThread(threading.Thread):
         self._last_pt = None
         if on:
             print("\n[MOUSE RELAY ON]  TEST MODE: Surface cursor still moves; "
-                  "watch 'mouse pkt/s' below. (Ctrl+Alt+End to stop)")
+                  "watch 'mouse pkt/s' below. (Ctrl+Alt+Shift again to stop)")
         else:
             self.sender.control(P.CTRL_RELEASE_ALL_KBM)
             print("\n[MOUSE RELAY OFF]")
@@ -224,15 +227,18 @@ class HookThread(threading.Thread):
     def _keyboard_proc(self, nCode, wParam, lParam):
         try:
             if nCode == 0:
-                kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                if kb.vkCode == HOTKEY_VK and key_down(VK_CONTROL) and key_down(VK_MENU):
-                    if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                        if key_down(VK_SHIFT):
-                            if self.thread_id is not None:
-                                user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
-                        else:
-                            self._toggle()
-                    return 1  # swallow only the hotkey itself
+                mods_down = (key_down(VK_CONTROL) and key_down(VK_MENU)
+                             and key_down(VK_SHIFT))
+                if mods_down:
+                    kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    if kb.vkCode == VK_Q and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        if self.thread_id is not None:
+                            user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+                    elif not self._combo_latched:
+                        self._combo_latched = True  # fire once per gesture
+                        self._toggle()
+                else:
+                    self._combo_latched = False
         except Exception as e:
             print("keyboard hook error (ignored):", e)
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
@@ -452,7 +458,7 @@ def main():
     print(f"InputRelay sender -> {TARGET_IP}:{TARGET_PORT}")
     print("Controller relay: ON (always).")
     print("Keyboard relay: DISABLED (safe mode -- keyboard stays local).")
-    print("Mouse capture: OFF. Ctrl+Alt+End = toggle, Ctrl+Alt+Shift+End = quit, "
+    print("Mouse relay: OFF. Hold Ctrl+Alt+Shift = toggle, Ctrl+Alt+Shift+Q = quit, "
           "Ctrl+C also quits.")
 
     hooks.start()

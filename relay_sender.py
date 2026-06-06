@@ -2,27 +2,22 @@
 """
 relay_sender.py -- Surface-side program for InputRelay (run this on the Surface).
 
-** SAFE / MOUSE-TEST MODE **
-Keyboard relay is currently DISABLED. The keyboard is never suppressed and never
-sent -- it only listens for the toggle/quit hotkey -- so your Surface keyboard
-always works locally and Ctrl+C in the terminal always kills the program. We will
-re-enable keyboard relay once mouse capture is confirmed working.
-
-What this relays right now:
+What this relays:
   * Game controller (paired over Bluetooth) -- ALWAYS relayed.
-  * Mouse -- TOGGLEABLE "capture mode". While ON, mouse movement/buttons/wheel
-    drive the gaming PC and are blocked locally; while OFF, the mouse is normal.
+  * Keyboard + mouse -- TOGGLEABLE "capture mode". While ON, all keys, mouse
+    motion/clicks/wheel drive the gaming PC and are fully blocked locally (incl.
+    touchscreen, via an invisible overlay); while OFF, the Surface is normal.
 
 Hotkeys:
-  * Ctrl+Alt+End        -> toggle MOUSE capture on/off
-  * Ctrl+Alt+Shift+End  -> quit the program
-  * (and Ctrl+C in the terminal always works, since the keyboard is not grabbed)
+  * Hold Ctrl+Alt+Shift  -> toggle capture on/off
+  * Ctrl+Alt+Shift+Q     -> quit the program
 
-Design fix vs. the first version: the low-level hook callback does NO blocking
-work (no network sends, no beeps) -- it only updates shared state. A worker thread
-sends accumulated mouse deltas, so the OS input pipeline never stalls.
+The toggle/quit hotkey is detected from modifier state tracked directly from the
+hook events (not the suppressed key state), so it ALWAYS works -- even while every
+other key is grabbed. While capture is OFF the keyboard is never touched, so
+Ctrl+C in the terminal also quits.
 
-Requires Windows. Controller part needs XInput-Python; mouse uses pure ctypes.
+Requires Windows. Controller part needs XInput-Python; kbd/mouse use pure ctypes.
 """
 
 import ctypes
@@ -40,7 +35,7 @@ except ImportError:
     winsound = None
 
 # ----------------------- config -----------------------
-TARGET_IP = "10.0.0.44"      # gaming PC running receiver.py
+TARGET_IP = "10.0.0.209"     # gaming PC running receiver.py
 TARGET_PORT = 9999
 KEEPALIVE_MS = 100           # resend held mouse-button state at least this often
 MOUSE_FLUSH_MS = 2           # how often the worker flushes accumulated mouse motion
@@ -59,8 +54,16 @@ WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
 
 WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
 WM_QUIT = 0x0012
+LLKHF_EXTENDED = 0x01
+
+# vk codes for the three modifiers (generic + left/right variants the LL hook reports)
+_CTRL_VKS = frozenset({0x11, 0xA2, 0xA3})
+_ALT_VKS = frozenset({0x12, 0xA4, 0xA5})
+_SHIFT_VKS = frozenset({0x10, 0xA0, 0xA1})
 
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN = 0x0201
@@ -233,6 +236,7 @@ class MouseState:
         self.wheel = 0
         self.buttons = 0
         self.buttons_dirty = False
+        self.keys = set()  # currently-pressed keyboard keys: (extended<<8)|scancode
 
 
 # ============================================================
@@ -251,6 +255,7 @@ class HookThread(threading.Thread):
         self._ms_hook = None
         self._last_pt = None  # for delta tracking in non-suppressing test mode
         self._combo_latched = False  # edge-trigger for the Ctrl+Alt+Shift hotkey
+        self._down = set()           # vk codes currently held (for reliable hotkey detect)
         self._overlay = None         # fullscreen blocker window
         self._wndproc = WNDPROC(self._wnd_proc)
         self._wndclass = None
@@ -264,6 +269,7 @@ class HookThread(threading.Thread):
             self.m.acc_dx = self.m.acc_dy = self.m.wheel = 0
             self.m.buttons = 0
             self.m.buttons_dirty = False
+            self.m.keys.clear()
         self._last_pt = None
         if on:
             if self._overlay:
@@ -308,11 +314,23 @@ class HookThread(threading.Thread):
     def _keyboard_proc(self, nCode, wParam, lParam):
         try:
             if nCode == 0:
-                mods_down = (key_down(VK_CONTROL) and key_down(VK_MENU)
-                             and key_down(VK_SHIFT))
+                kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                vk = kb.vkCode
+                is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                is_up = wParam in (WM_KEYUP, WM_SYSKEYUP)
+
+                # Track held keys ourselves so hotkey detection is reliable even
+                # while every key is being suppressed (don't trust suppressed state).
+                if is_down:
+                    self._down.add(vk)
+                elif is_up:
+                    self._down.discard(vk)
+
+                mods_down = (bool(self._down & _CTRL_VKS) and
+                             bool(self._down & _ALT_VKS) and
+                             bool(self._down & _SHIFT_VKS))
                 if mods_down:
-                    kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                    if kb.vkCode == VK_Q and wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    if vk == VK_Q and is_down:
                         if self.thread_id is not None:
                             user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
                     elif not self._combo_latched:
@@ -320,6 +338,21 @@ class HookThread(threading.Thread):
                         self._toggle()
                 else:
                     self._combo_latched = False
+
+                # Relay + suppress all keys while capturing (full takeover).
+                with self.m.lock:
+                    capturing = self.m.capture
+                if capturing:
+                    extended = 1 if (kb.flags & LLKHF_EXTENDED) else 0
+                    key = (extended << 8) | (kb.scanCode & 0xFF)
+                    with self.m.lock:
+                        if is_down:
+                            self.m.keys.add(key)
+                        elif is_up:
+                            self.m.keys.discard(key)
+                        snap = list(self.m.keys)
+                    self.sender.keyboard(snap)
+                    return 1
         except Exception as e:
             print("keyboard hook error (ignored):", e)
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
@@ -406,6 +439,7 @@ def mouse_worker(sender, mstate, stop):
     interval = MOUSE_FLUSH_MS / 1000.0
     keepalive = KEEPALIVE_MS / 1000.0
     last_send = 0.0
+    last_kb = 0.0
     pkt = 0
     last_report = time.time()
     last_dx = last_dy = 0
@@ -417,9 +451,15 @@ def mouse_worker(sender, mstate, stop):
             dx, dy, wheel = mstate.acc_dx, mstate.acc_dy, mstate.wheel
             buttons = mstate.buttons
             dirty = mstate.buttons_dirty
+            kb_snap = list(mstate.keys)
             mstate.acc_dx = mstate.acc_dy = mstate.wheel = 0
             mstate.buttons_dirty = False
         now = time.time()
+        # Keyboard keepalive: periodically resend the held-key snapshot so a lost
+        # UDP packet self-corrects and the receiver watchdog never drops a key.
+        if now - last_kb >= keepalive:
+            sender.keyboard(kb_snap)
+            last_kb = now
         if dx or dy or wheel or dirty:
             # clamp deltas to int16 range just in case
             dx = max(-32768, min(32767, dx))
@@ -542,9 +582,8 @@ def main():
 
     print(f"InputRelay sender -> {TARGET_IP}:{TARGET_PORT}")
     print("Controller relay: ON (always).")
-    print("Keyboard relay: DISABLED (safe mode -- keyboard stays local).")
-    print("Mouse relay: OFF. Hold Ctrl+Alt+Shift = toggle, Ctrl+Alt+Shift+Q = quit, "
-          "Ctrl+C also quits.")
+    print("Keyboard+mouse capture: OFF. Hold Ctrl+Alt+Shift = toggle, "
+          "Ctrl+Alt+Shift+Q = quit (Ctrl+C also quits while capture is off).")
 
     hooks.start()
     ctrl.start()

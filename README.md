@@ -32,12 +32,15 @@ Both ends must have `protocol.py` next to the script they run.
 
 | Hotkey | Action |
 |--------|--------|
-| **Ctrl + Alt + End** | toggle keyboard/mouse capture on/off |
-| **Ctrl + Alt + Shift + End** | quit the program (always restores local input) |
+| **Hold Ctrl + Alt + Shift** | toggle keyboard/mouse capture on/off |
+| **Ctrl + Alt + Shift + Q** | quit the program (always restores local input) |
 
-A short beep confirms each toggle (rising = capture on, falling = off). If the
-program ever exits or crashes, Windows removes the hooks automatically, so your
-Surface input is never permanently locked.
+A short beep confirms each toggle (rising = capture on, falling = off). The
+hotkey is detected from modifier state tracked directly from the hook events, so
+it works even while every other key is being grabbed. If the program ever exits
+or crashes, Windows removes the hooks automatically, so your Surface input is
+never permanently locked. While capture is OFF the keyboard is untouched, so
+Ctrl+C in the terminal also quits.
 
 ---
 

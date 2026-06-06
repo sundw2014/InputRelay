@@ -1,0 +1,5 @@
+# Gaming PC (receiver.py) dependencies. Windows only.
+# Keyboard/mouse injection uses pure ctypes (SendInput); no package needed.
+# Also requires the ViGEmBus driver installed separately:
+#   https://github.com/nefarius/ViGEmBus/releases
+vgamepad>=0.1.0

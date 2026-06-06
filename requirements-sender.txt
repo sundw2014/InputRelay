@@ -1,0 +1,4 @@
+# Surface (relay_sender.py) dependencies. Windows only.
+# Keyboard/mouse capture uses pure ctypes (no package needed).
+# The controller is paired through Windows' own Bluetooth (no driver needed).
+XInput-Python>=0.4.0

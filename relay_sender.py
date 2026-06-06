@@ -219,6 +219,10 @@ class Sender:
         with self.lock:
             self.sock.sendto(P.pack_mouse(self._next(P.T_MOUSE), dx, dy, wheel, buttons), self.addr)
 
+    def keyboard(self, keys):
+        with self.lock:
+            self.sock.sendto(P.pack_keyboard(self._next(P.T_KEYBOARD), keys), self.addr)
+
     def control(self, subtype):
         with self.lock:
             self.sock.sendto(P.pack_control(self._next(P.T_CONTROL), subtype), self.addr)

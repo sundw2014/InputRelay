@@ -215,11 +215,12 @@ class HookThread(threading.Thread):
             self.m.buttons_dirty = False
         self._last_pt = None
         if on:
-            print("\n[MOUSE RELAY ON]  TEST MODE: Surface cursor still moves; "
-                  "watch 'mouse pkt/s' below. (Ctrl+Alt+Shift again to stop)")
+            user32.SetCursorPos(self.cx, self.cy)
+            print("\n[MOUSE CAPTURE ON]  Surface mouse pinned; motion/clicks/wheel "
+                  "go to the gaming PC. (Ctrl+Alt+Shift to release)")
         else:
             self.sender.control(P.CTRL_RELEASE_ALL_KBM)
-            print("\n[MOUSE RELAY OFF]")
+            print("\n[MOUSE CAPTURE OFF] mouse restored locally")
         async_beep(on)
 
     # keyboard: detect hotkey only; never suppress normal keys, never relay.
@@ -246,8 +247,9 @@ class HookThread(threading.Thread):
     # mouse: only accumulate state; the worker thread sends.
     # Wrapped so an exception falls through to a normal (non-captured) mouse event.
     def _mouse_proc(self, nCode, wParam, lParam):
-        # TEST MODE: observe and relay, but DO NOT suppress -- the Surface mouse
-        # keeps working normally. Deltas are computed from successive positions.
+        # CAPTURE MODE: suppress all mouse input locally (return 1) and relay it.
+        # Motion deltas are taken relative to screen center, and the cursor is
+        # re-pinned to center each event so it never drifts or hits a screen edge.
         try:
             if nCode == 0:
                 with self.m.lock:
@@ -255,30 +257,32 @@ class HookThread(threading.Thread):
                 if capturing:
                     ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                     if wParam == WM_MOUSEMOVE:
-                        x, y = ms.pt.x, ms.pt.y
-                        if self._last_pt is not None:
-                            dx = x - self._last_pt[0]
-                            dy = y - self._last_pt[1]
+                        if not (ms.flags & LLMHF_INJECTED):
+                            dx = ms.pt.x - self.cx
+                            dy = ms.pt.y - self.cy
                             if dx or dy:
                                 with self.m.lock:
                                     self.m.acc_dx += dx
                                     self.m.acc_dy += dy
-                        self._last_pt = (x, y)
-                    elif wParam == WM_MOUSEWHEEL:
+                            user32.SetCursorPos(self.cx, self.cy)
+                        return 1
+                    if wParam == WM_MOUSEWHEEL:
                         delta = ctypes.c_short((ms.mouseData >> 16) & 0xFFFF).value
                         with self.m.lock:
                             self.m.wheel += delta // WHEEL_DELTA
-                    else:
-                        btn = self._button_for(wParam, ms.mouseData)
-                        if btn is not None:
-                            down = wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
-                                              WM_MBUTTONDOWN, WM_XBUTTONDOWN)
-                            with self.m.lock:
-                                if down:
-                                    self.m.buttons |= btn
-                                else:
-                                    self.m.buttons &= ~btn
-                                self.m.buttons_dirty = True
+                        return 1
+                    btn = self._button_for(wParam, ms.mouseData)
+                    if btn is not None:
+                        down = wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
+                                          WM_MBUTTONDOWN, WM_XBUTTONDOWN)
+                        with self.m.lock:
+                            if down:
+                                self.m.buttons |= btn
+                            else:
+                                self.m.buttons &= ~btn
+                            self.m.buttons_dirty = True
+                        return 1
+                    return 1  # swallow any other mouse message while pinned
         except Exception as e:
             print("mouse hook error (ignored):", e)
         return user32.CallNextHookEx(None, nCode, wParam, lParam)

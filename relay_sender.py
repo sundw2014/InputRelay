@@ -88,6 +88,38 @@ kernel32 = ctypes.windll.kernel32 if sys.platform == "win32" else None
 HOOKPROC = ctypes.CFUNCTYPE(LRESULT, ctypes.c_int, WPARAM, LPARAM)
 
 HHOOK = ctypes.c_void_p
+HWND = ctypes.c_void_p
+HINSTANCE = ctypes.c_void_p
+
+# Overlay window constants
+WS_POPUP = 0x80000000
+WS_EX_TOPMOST = 0x00000008
+WS_EX_LAYERED = 0x00080000
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
+LWA_ALPHA = 0x02
+SW_HIDE = 0
+SW_SHOWNOACTIVATE = 4
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+OVERLAY_CLASS = "InputRelayBlockerOverlay"
+
+WNDPROC = ctypes.CFUNCTYPE(LRESULT, HWND, wintypes.UINT, WPARAM, LPARAM)
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [("style", wintypes.UINT),
+                ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", HINSTANCE),
+                ("hIcon", ctypes.c_void_p),
+                ("hCursor", ctypes.c_void_p),
+                ("hbrBackground", ctypes.c_void_p),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR)]
 
 
 def _setup_winapi():
@@ -113,6 +145,22 @@ def _setup_winapi():
     user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
     user32.GetAsyncKeyState.restype = wintypes.SHORT
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    # overlay window
+    user32.DefWindowProcW.argtypes = [HWND, wintypes.UINT, WPARAM, LPARAM]
+    user32.DefWindowProcW.restype = LRESULT
+    user32.RegisterClassW.argtypes = [ctypes.c_void_p]
+    user32.RegisterClassW.restype = wintypes.ATOM
+    user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                       wintypes.DWORD, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int, HWND, ctypes.c_void_p,
+                                       HINSTANCE, ctypes.c_void_p]
+    user32.CreateWindowExW.restype = HWND
+    user32.ShowWindow.argtypes = [HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetLayeredWindowAttributes.argtypes = [HWND, wintypes.DWORD, wintypes.BYTE, wintypes.DWORD]
+    user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = HINSTANCE
 
 
 if user32 is not None:
@@ -203,6 +251,9 @@ class HookThread(threading.Thread):
         self._ms_hook = None
         self._last_pt = None  # for delta tracking in non-suppressing test mode
         self._combo_latched = False  # edge-trigger for the Ctrl+Alt+Shift hotkey
+        self._overlay = None         # fullscreen blocker window
+        self._wndproc = WNDPROC(self._wnd_proc)
+        self._wndclass = None
         self.cx = user32.GetSystemMetrics(SM_CXSCREEN) // 2
         self.cy = user32.GetSystemMetrics(SM_CYSCREEN) // 2
 
@@ -215,13 +266,42 @@ class HookThread(threading.Thread):
             self.m.buttons_dirty = False
         self._last_pt = None
         if on:
+            if self._overlay:
+                user32.ShowWindow(self._overlay, SW_SHOWNOACTIVATE)
             user32.SetCursorPos(self.cx, self.cy)
-            print("\n[MOUSE CAPTURE ON]  Surface mouse pinned; motion/clicks/wheel "
-                  "go to the gaming PC. (Ctrl+Alt+Shift to release)")
+            print("\n[MOUSE CAPTURE ON]  Surface input blocked (incl. touch); "
+                  "motion/clicks/wheel go to the gaming PC. (Ctrl+Alt+Shift to release)")
         else:
+            if self._overlay:
+                user32.ShowWindow(self._overlay, SW_HIDE)
             self.sender.control(P.CTRL_RELEASE_ALL_KBM)
             print("\n[MOUSE CAPTURE OFF] mouse restored locally")
         async_beep(on)
+
+    # The overlay window just absorbs any pointer/touch input that reaches it.
+    def _wnd_proc(self, hwnd, msg, wParam, lParam):
+        return user32.DefWindowProcW(hwnd, msg, wParam, lParam)
+
+    def _create_overlay(self):
+        hinst = kernel32.GetModuleHandleW(None)
+        self._wndclass = WNDCLASSW()
+        self._wndclass.lpfnWndProc = self._wndproc
+        self._wndclass.hInstance = hinst
+        self._wndclass.lpszClassName = OVERLAY_CLASS
+        user32.RegisterClassW(ctypes.byref(self._wndclass))  # ok if already registered
+        vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        exstyle = (WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+        self._overlay = user32.CreateWindowExW(
+            exstyle, OVERLAY_CLASS, "overlay", WS_POPUP,
+            vx, vy, vw, vh, None, None, hinst, None)
+        if self._overlay:
+            # alpha=1 -> effectively invisible but still receives input.
+            user32.SetLayeredWindowAttributes(self._overlay, 0, 1, LWA_ALPHA)
+        else:
+            print("WARNING: could not create blocker overlay; touch input may leak.")
 
     # keyboard: detect hotkey only; never suppress normal keys, never relay.
     # Wrapped so an exception can NEVER brick the keyboard (always passes through).
@@ -307,6 +387,7 @@ class HookThread(threading.Thread):
             print("ERROR: failed to install input hooks. Try running as Administrator.")
             self.on_quit()
             return
+        self._create_overlay()
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))

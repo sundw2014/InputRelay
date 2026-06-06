@@ -2,28 +2,27 @@
 """
 relay_sender.py -- Surface-side program for InputRelay (run this on the Surface).
 
-A single program that relays input to the gaming PC over UDP:
+** SAFE / MOUSE-TEST MODE **
+Keyboard relay is currently DISABLED. The keyboard is never suppressed and never
+sent -- it only listens for the toggle/quit hotkey -- so your Surface keyboard
+always works locally and Ctrl+C in the terminal always kills the program. We will
+re-enable keyboard relay once mouse capture is confirmed working.
 
-  * Game controller (paired to this PC over Bluetooth) -- ALWAYS relayed while
-    the program runs. It never blocks using the Surface, so it stays on.
+What this relays right now:
+  * Game controller (paired over Bluetooth) -- ALWAYS relayed.
+  * Mouse -- TOGGLEABLE "capture mode". While ON, mouse movement/buttons/wheel
+    drive the gaming PC and are blocked locally; while OFF, the mouse is normal.
 
-  * Keyboard + mouse -- a TOGGLEABLE "capture mode". While ON, every key and
-    mouse movement drives the gaming PC and is blocked locally on the Surface
-    (full takeover), except the reserved hotkeys. While OFF, the Surface behaves
-    normally.
+Hotkeys:
+  * Ctrl+Alt+End        -> toggle MOUSE capture on/off
+  * Ctrl+Alt+Shift+End  -> quit the program
+  * (and Ctrl+C in the terminal always works, since the keyboard is not grabbed)
 
-Hotkeys (configurable below):
-  * Ctrl+Alt+End            -> toggle keyboard/mouse capture on/off
-  * Ctrl+Alt+Shift+End      -> quit this program (always restores input)
+Design fix vs. the first version: the low-level hook callback does NO blocking
+work (no network sends, no beeps) -- it only updates shared state. A worker thread
+sends accumulated mouse deltas, so the OS input pipeline never stalls.
 
-On toggle, a short beep gives feedback (rising = ON, falling = OFF).
-
-Requires Windows (uses Win32 low-level hooks + SendInput-style relay). The
-controller part needs XInput-Python; keyboard/mouse use pure ctypes.
-
-Setup:
-    pip install XInput-Python
-    edit TARGET_IP below, then:  python relay_sender.py
+Requires Windows. Controller part needs XInput-Python; mouse uses pure ctypes.
 """
 
 import ctypes
@@ -43,27 +42,22 @@ except ImportError:
 # ----------------------- config -----------------------
 TARGET_IP = "10.0.0.44"      # gaming PC running receiver.py
 TARGET_PORT = 9999
-KEEPALIVE_MS = 100           # resend held state at least this often
+KEEPALIVE_MS = 100           # resend held mouse-button state at least this often
+MOUSE_FLUSH_MS = 2           # how often the worker flushes accumulated mouse motion
 CONTROLLER_POLL_HZ = 500
 
-# Hotkeys: trigger key + required modifiers.
-HOTKEY_VK = 0x23             # VK_END
-# (Ctrl+Alt = toggle, Ctrl+Alt+Shift = quit)
+HOTKEY_VK = 0x23             # VK_END  (Ctrl+Alt = toggle, +Shift = quit)
 # ------------------------------------------------------
 
-# ---- Virtual-key codes ----
 VK_CONTROL = 0x11
 VK_MENU = 0x12     # ALT
 VK_SHIFT = 0x10
 
-# ---- Win32 hook constants ----
 WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
 
 WM_KEYDOWN = 0x0100
-WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
-WM_SYSKEYUP = 0x0105
 WM_QUIT = 0x0012
 
 WM_MOUSEMOVE = 0x0200
@@ -77,13 +71,9 @@ WM_MOUSEWHEEL = 0x020A
 WM_XBUTTONDOWN = 0x020B
 WM_XBUTTONUP = 0x020C
 
-LLKHF_EXTENDED = 0x01
-LLKHF_UP = 0x80
 LLMHF_INJECTED = 0x01
-
 SM_CXSCREEN = 0
 SM_CYSCREEN = 1
-
 WHEEL_DELTA = 120
 
 LRESULT = ctypes.c_ssize_t
@@ -91,7 +81,7 @@ WPARAM = ctypes.c_size_t
 LPARAM = ctypes.c_ssize_t
 ULONG_PTR = ctypes.c_size_t
 
-user32 = ctypes.windll.user32
+user32 = ctypes.windll.user32 if sys.platform == "win32" else None
 HOOKPROC = ctypes.CFUNCTYPE(LRESULT, ctypes.c_int, WPARAM, LPARAM)
 
 
@@ -100,18 +90,14 @@ class POINT(ctypes.Structure):
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("vkCode", wintypes.DWORD),
-                ("scanCode", wintypes.DWORD),
-                ("flags", wintypes.DWORD),
-                ("time", wintypes.DWORD),
+    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
                 ("dwExtraInfo", ULONG_PTR)]
 
 
 class MSLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("pt", POINT),
-                ("mouseData", wintypes.DWORD),
-                ("flags", wintypes.DWORD),
-                ("time", wintypes.DWORD),
+    _fields_ = [("pt", POINT), ("mouseData", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
                 ("dwExtraInfo", ULONG_PTR)]
 
 
@@ -119,8 +105,14 @@ def key_down(vk):
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
 
+def async_beep(on):
+    if winsound:
+        threading.Thread(target=winsound.Beep,
+                         args=(1200 if on else 600, 80), daemon=True).start()
+
+
 # ============================================================
-# Shared state + UDP sender
+# UDP sender
 # ============================================================
 class Sender:
     def __init__(self, ip, port):
@@ -142,31 +134,33 @@ class Sender:
         with self.lock:
             self.sock.sendto(P.pack_mouse(self._next(P.T_MOUSE), dx, dy, wheel, buttons), self.addr)
 
-    def keyboard(self, keys):
-        with self.lock:
-            self.sock.sendto(P.pack_keyboard(self._next(P.T_KEYBOARD), keys), self.addr)
-
     def control(self, subtype):
         with self.lock:
             self.sock.sendto(P.pack_control(self._next(P.T_CONTROL), subtype), self.addr)
 
 
-class State:
+# ============================================================
+# Shared mouse state (written by hook, read by worker)
+# ============================================================
+class MouseState:
     def __init__(self):
         self.lock = threading.Lock()
         self.capture = False
-        self.pressed_keys = set()   # u16: (extended<<8)|scancode
-        self.mouse_buttons = 0
+        self.acc_dx = 0
+        self.acc_dy = 0
+        self.wheel = 0
+        self.buttons = 0
+        self.buttons_dirty = False
 
 
 # ============================================================
-# Keyboard + mouse hooks (run on their own thread w/ message loop)
+# Hooks (own thread + message loop). Callback does NO blocking I/O.
 # ============================================================
 class HookThread(threading.Thread):
-    def __init__(self, sender, state, on_quit):
+    def __init__(self, sender, mstate, on_quit):
         super().__init__(daemon=True)
         self.sender = sender
-        self.state = state
+        self.m = mstate
         self.on_quit = on_quit
         self.thread_id = None
         self._kb_proc = HOOKPROC(self._keyboard_proc)
@@ -176,98 +170,68 @@ class HookThread(threading.Thread):
         self.cx = user32.GetSystemMetrics(SM_CXSCREEN) // 2
         self.cy = user32.GetSystemMetrics(SM_CYSCREEN) // 2
 
-    # ---- capture toggle ----
-    def _set_capture(self, on):
-        with self.state.lock:
-            self.state.capture = on
-            self.state.pressed_keys.clear()
-            self.state.mouse_buttons = 0
+    def _toggle(self):
+        with self.m.lock:
+            self.m.capture = not self.m.capture
+            on = self.m.capture
+            self.m.acc_dx = self.m.acc_dy = self.m.wheel = 0
+            self.m.buttons = 0
+            self.m.buttons_dirty = False
         if on:
             user32.SetCursorPos(self.cx, self.cy)
-            print("\n[CAPTURE ON] keyboard+mouse now drive the gaming PC "
-                  "(Ctrl+Alt+End to release).")
-            self._beep(True)
+            print("\n[MOUSE CAPTURE ON]  (Ctrl+Alt+End to release)")
         else:
-            # Tell the receiver to drop everything immediately.
             self.sender.control(P.CTRL_RELEASE_ALL_KBM)
-            print("\n[CAPTURE OFF] Surface keyboard+mouse restored.")
-            self._beep(False)
+            print("\n[MOUSE CAPTURE OFF] mouse restored locally")
+        async_beep(on)
 
-    @staticmethod
-    def _beep(on):
-        if winsound:
-            winsound.Beep(1200 if on else 600, 80)
-
-    # ---- keyboard hook ----
+    # keyboard: detect hotkey only; never suppress normal keys, never relay.
     def _keyboard_proc(self, nCode, wParam, lParam):
         if nCode == 0:
             kb = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            is_up = wParam in (WM_KEYUP, WM_SYSKEYUP)
-            is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
-
-            # Reserved hotkeys: act on key-down, swallow both down and up.
             if kb.vkCode == HOTKEY_VK and key_down(VK_CONTROL) and key_down(VK_MENU):
-                if is_down:
+                if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
                     if key_down(VK_SHIFT):
-                        self._request_quit()
+                        if self.thread_id is not None:
+                            user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
                     else:
-                        with self.state.lock:
-                            now_on = not self.state.capture
-                        self._set_capture(now_on)
-                return 1  # swallow
-
-            with self.state.lock:
-                capturing = self.state.capture
-            if capturing:
-                extended = 1 if (kb.flags & LLKHF_EXTENDED) else 0
-                key = (extended << 8) | (kb.scanCode & 0xFF)
-                with self.state.lock:
-                    if is_down:
-                        self.state.pressed_keys.add(key)
-                    elif is_up:
-                        self.state.pressed_keys.discard(key)
-                    snapshot = list(self.state.pressed_keys)
-                self.sender.keyboard(snapshot)
-                return 1  # swallow locally (full takeover)
-
+                        self._toggle()
+                return 1  # swallow only the hotkey itself
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-    # ---- mouse hook ----
+    # mouse: only accumulate state; the worker thread sends.
     def _mouse_proc(self, nCode, wParam, lParam):
         if nCode == 0:
-            with self.state.lock:
-                capturing = self.state.capture
+            with self.m.lock:
+                capturing = self.m.capture
             if capturing:
                 ms = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                injected = bool(ms.flags & LLMHF_INJECTED)
-
                 if wParam == WM_MOUSEMOVE:
-                    if not injected:
+                    if not (ms.flags & LLMHF_INJECTED):
                         dx = ms.pt.x - self.cx
                         dy = ms.pt.y - self.cy
                         if dx or dy:
-                            self.sender.mouse(dx, dy, 0, self.state.mouse_buttons)
-                        user32.SetCursorPos(self.cx, self.cy)  # re-pin to center
+                            with self.m.lock:
+                                self.m.acc_dx += dx
+                                self.m.acc_dy += dy
+                            user32.SetCursorPos(self.cx, self.cy)
                     return 1
-
                 if wParam == WM_MOUSEWHEEL:
                     delta = ctypes.c_short((ms.mouseData >> 16) & 0xFFFF).value
-                    self.sender.mouse(0, 0, delta // WHEEL_DELTA, self.state.mouse_buttons)
+                    with self.m.lock:
+                        self.m.wheel += delta // WHEEL_DELTA
                     return 1
-
                 btn = self._button_for(wParam, ms.mouseData)
                 if btn is not None:
                     down = wParam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN,
                                       WM_MBUTTONDOWN, WM_XBUTTONDOWN)
-                    with self.state.lock:
+                    with self.m.lock:
                         if down:
-                            self.state.mouse_buttons |= btn
+                            self.m.buttons |= btn
                         else:
-                            self.state.mouse_buttons &= ~btn
-                        buttons = self.state.mouse_buttons
-                    self.sender.mouse(0, 0, 0, buttons)
+                            self.m.buttons &= ~btn
+                        self.m.buttons_dirty = True
                     return 1
-
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     @staticmethod
@@ -282,11 +246,6 @@ class HookThread(threading.Thread):
             return P.MB_X1 if ((mouseData >> 16) & 0xFFFF) == 1 else P.MB_X2
         return None
 
-    def _request_quit(self):
-        if self.thread_id is not None:
-            user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
-
-    # ---- thread body ----
     def run(self):
         self.thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
         self._kb_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_proc, None, 0)
@@ -295,13 +254,10 @@ class HookThread(threading.Thread):
             print("ERROR: failed to install input hooks. Try running as Administrator.")
             self.on_quit()
             return
-
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
-
-        # WM_QUIT received -> clean up and signal main.
         if self._kb_hook:
             user32.UnhookWindowsHookEx(self._kb_hook)
         if self._ms_hook:
@@ -310,22 +266,33 @@ class HookThread(threading.Thread):
 
 
 # ============================================================
-# Keepalive: resend held kbd/mouse state so the receiver watchdog stays alive
+# Mouse worker: flush accumulated motion/wheel/buttons over UDP
 # ============================================================
-def keepalive_loop(sender, state, stop):
-    interval = KEEPALIVE_MS / 1000.0
+def mouse_worker(sender, mstate, stop):
+    interval = MOUSE_FLUSH_MS / 1000.0
+    keepalive = KEEPALIVE_MS / 1000.0
+    last_send = 0.0
     while not stop.is_set():
-        with state.lock:
-            if state.capture:
-                keys = list(state.pressed_keys)
-                buttons = state.mouse_buttons
-                active = True
-            else:
-                active = False
-        if active:
-            sender.keyboard(keys)
-            sender.mouse(0, 0, 0, buttons)
         time.sleep(interval)
+        with mstate.lock:
+            if not mstate.capture:
+                continue
+            dx, dy, wheel = mstate.acc_dx, mstate.acc_dy, mstate.wheel
+            buttons = mstate.buttons
+            dirty = mstate.buttons_dirty
+            mstate.acc_dx = mstate.acc_dy = mstate.wheel = 0
+            mstate.buttons_dirty = False
+        now = time.time()
+        if dx or dy or wheel or dirty:
+            # clamp deltas to int16 range just in case
+            dx = max(-32768, min(32767, dx))
+            dy = max(-32768, min(32767, dy))
+            wheel = max(-128, min(127, wheel))
+            sender.mouse(dx, dy, wheel, buttons)
+            last_send = now
+        elif now - last_send >= keepalive:
+            sender.mouse(0, 0, 0, buttons)
+            last_send = now
 
 
 # ============================================================
@@ -358,7 +325,7 @@ def controller_loop(sender, stop):
         import XInput
     except ImportError:
         print("NOTE: XInput-Python not installed -> controller relay disabled "
-              "(keyboard/mouse still work). pip install XInput-Python to enable.")
+              "(mouse still works). pip install XInput-Python to enable.")
         return
 
     XInput.set_deadzone(XInput.DEADZONE_LEFT_THUMB, 0)
@@ -422,24 +389,22 @@ def main():
         sys.exit("relay_sender.py must run on Windows (uses Win32 hooks + XInput).")
 
     sender = Sender(TARGET_IP, TARGET_PORT)
-    state = State()
+    mstate = MouseState()
     stop = threading.Event()
 
-    def on_quit():
-        stop.set()
-
-    hooks = HookThread(sender, state, on_quit)
+    hooks = HookThread(sender, mstate, stop.set)
     ctrl = threading.Thread(target=controller_loop, args=(sender, stop), daemon=True)
-    keep = threading.Thread(target=keepalive_loop, args=(sender, state, stop), daemon=True)
+    work = threading.Thread(target=mouse_worker, args=(sender, mstate, stop), daemon=True)
 
     print(f"InputRelay sender -> {TARGET_IP}:{TARGET_PORT}")
     print("Controller relay: ON (always).")
-    print("Keyboard/mouse capture: OFF. Press Ctrl+Alt+End to toggle, "
-          "Ctrl+Alt+Shift+End to quit.")
+    print("Keyboard relay: DISABLED (safe mode -- keyboard stays local).")
+    print("Mouse capture: OFF. Ctrl+Alt+End = toggle, Ctrl+Alt+Shift+End = quit, "
+          "Ctrl+C also quits.")
 
     hooks.start()
     ctrl.start()
-    keep.start()
+    work.start()
 
     try:
         while not stop.is_set():
@@ -448,9 +413,9 @@ def main():
         pass
     finally:
         stop.set()
-        # If we still have capture on, make sure the receiver releases everything.
         sender.control(P.CTRL_RELEASE_ALL_KBM)
-        hooks._request_quit()
+        if hooks.thread_id is not None:
+            user32.PostThreadMessageW(hooks.thread_id, WM_QUIT, 0, 0)
         time.sleep(0.2)
         print("\nBye.")
 
